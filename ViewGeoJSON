@@ -1,0 +1,176 @@
+# -*- coding: utf-8 -*-
+# Colab 단일 셀: GeoJSON -> 인터랙티브 지도(Leaflet/Folium)
+
+import sys, os, json, re, math, warnings
+warnings.filterwarnings("ignore")
+from datetime import datetime
+
+# 1) 패키지 설치
+import subprocess
+def pip_install(pkgs):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet"] + pkgs)
+
+pip_install(["folium==0.17.0", "geopandas==1.0.1", "shapely>=2.0.4", "pyproj>=3.6.1", "mapclassify>=2.8.1"])
+
+# 2) 경로 & 업로드
+GEOJSON_PATH = "/content/target.geojson"   # 기본 파일명
+HTML_OUT     = "/content/geojson_map.html"
+
+# Colab 업로드 지원
+USE_COLAB = False
+try:
+    from google.colab import files  # type: ignore
+    USE_COLAB = True
+except:
+    pass
+
+if USE_COLAB and not os.path.exists(GEOJSON_PATH):
+    print("GeoJSON 파일을 업로드하세요 (예: target.geojson)")
+    uploaded = files.upload()
+    if uploaded:
+        # 첫 파일을 사용
+        fn = list(uploaded.keys())[0]
+        GEOJSON_PATH = "/content/" + fn
+        print("업로드 완료:", GEOJSON_PATH)
+
+assert os.path.exists(GEOJSON_PATH), f"GeoJSON을 찾을 수 없습니다: {GEOJSON_PATH}"
+
+# 3) 데이터 로드/좌표계 처리
+import geopandas as gpd
+from shapely.geometry import Point, Polygon, MultiPolygon, LineString, MultiLineString, GeometryCollection
+
+gdf = gpd.read_file(GEOJSON_PATH)
+
+# 좌표계 통일(WGS84) — folium은 경위도(EPSG:4326) 필요
+if gdf.crs is None:
+    # 좌표계가 없는 경우 WGS84로 가정 (필요시 수정)
+    gdf = gdf.set_crs(epsg=4326)
+elif gdf.crs.to_epsg() != 4326:
+    gdf = gdf.to_crs(epsg=4326)
+
+# 4) 중심/줌 계산
+def _center_zoom_from_gdf(_gdf):
+    try:
+        bounds = _gdf.total_bounds  # [minx, miny, maxx, maxy]
+        minx, miny, maxx, maxy = bounds
+        center = [(miny+maxy)/2.0, (minx+maxx)/2.0]
+        return center, bounds
+    except Exception:
+        return [37.5665, 126.9780], None  # 서울 시청 근처 fallback
+
+center, bounds = _center_zoom_from_gdf(gdf)
+
+# 5) folium 맵 생성
+import folium
+m = folium.Map(location=center, zoom_start=10, tiles="OpenStreetMap", control_scale=True)
+
+# 6) 보기 좋은 팝업/툴팁 생성 유틸
+from html import escape
+
+def record_to_html_table(props: dict, max_rows=30):
+    rows = []
+    for i, (k,v) in enumerate(props.items()):
+        if i >= max_rows:
+            rows.append(f"<tr><td colspan=2>… ({len(props)-max_rows} more)</td></tr>")
+            break
+        txt = escape(str(v)) if v is not None else ""
+        rows.append(f"<tr><th style='text-align:left;padding:4px 8px;background:#f5f5f5'>{escape(str(k))}</th>"
+                    f"<td style='padding:4px 8px'>{txt}</td></tr>")
+    return "<table style='border-collapse:collapse;font-size:12px'>" + "".join(rows) + "</table>"
+
+# 7) 지오메트리 타입별 레이어 추가
+from folium.plugins import MarkerCluster
+
+geom_types = gdf.geom_type.unique().tolist()
+has_points = any(gt in ("Point","MultiPoint") for gt in geom_types)
+has_lines  = any(gt in ("LineString","MultiLineString") for gt in geom_types)
+has_polys  = any(gt in ("Polygon","MultiPolygon") for gt in geom_types)
+
+# (A) 포인트 → MarkerCluster
+if has_points:
+    point_fg = folium.FeatureGroup(name="Points", show=True)
+    cluster = MarkerCluster(name="Point Cluster", show=True)
+    for idx, row in gdf[gdf.geometry.type.isin(["Point","MultiPoint"])].iterrows():
+        geom = row.geometry
+        # MultiPoint는 개별 점으로 분해
+        points = [geom] if geom.geom_type == "Point" else list(geom.geoms)
+        for pt in points:
+            lat, lon = pt.y, pt.x
+            html = record_to_html_table({k:row[k] for k in row.index if k != "geometry"})
+            folium.Marker([lat, lon],
+                          popup=folium.Popup(html, max_width=400)).add_to(cluster)
+    cluster.add_to(point_fg)
+    point_fg.add_to(m)
+
+# (B) 라인 → GeoJson 레이어
+if has_lines:
+    line_fg = folium.FeatureGroup(name="Lines", show=True)
+    folium.GeoJson(
+        gdf[gdf.geometry.type.isin(["LineString","MultiLineString"])].to_json(),
+        name="Lines",
+        tooltip=folium.GeoJsonTooltip(fields=[c for c in gdf.columns if c!="geometry"][:10], aliases=None),
+        popup=folium.GeoJsonPopup(fields=[c for c in gdf.columns if c!="geometry"][:10])
+    ).add_to(line_fg)
+    line_fg.add_to(m)
+
+# (C) 폴리곤 → GeoJson 기본 레이어 + (옵션) 자동 Choropleth
+if has_polys:
+    poly_gdf = gdf[gdf.geometry.type.isin(["Polygon","MultiPolygon"])].copy()
+
+    # 기본 스타일
+    def style_fn(_):
+        return {"fillColor": "#3388ff", "color": "#2c3e50", "weight": 1, "fillOpacity": 0.3}
+
+    poly_fg = folium.FeatureGroup(name="Polygons (styled)", show=True)
+    folium.GeoJson(
+        poly_gdf.to_json(),
+        name="Polygons",
+        style_function=style_fn,
+        tooltip=folium.GeoJsonTooltip(fields=[c for c in poly_gdf.columns if c!="geometry"][:10]),
+        popup=folium.GeoJsonPopup(fields=[c for c in poly_gdf.columns if c!="geometry"][:10])
+    ).add_to(poly_fg)
+    poly_fg.add_to(m)
+
+    # 자동 Choropleth: 첫 번째 숫자형 컬럼 감지
+    num_cols = [c for c in poly_gdf.columns if c!="geometry" and
+                (str(poly_gdf[c].dtype).startswith(("int","float")))]
+    if num_cols:
+        chor_col = num_cols[0]  # 기본: 첫 번째 숫자 컬럼
+        # folium.Choropleth는 key_on이 필요 → 인덱스를 속성으로 만들어 사용
+        poly_gdf = poly_gdf.reset_index().rename(columns={"index":"_fid_"})
+        # GeoJSON에도 _fid_ 포함되도록 재생성
+        gj = json.loads(poly_gdf.to_json())
+        ch = folium.Choropleth(
+            geo_data=gj,
+            data=poly_gdf[["_fid_", chor_col]],
+            columns=["_fid_", chor_col],
+            key_on="feature.properties._fid_",
+            fill_opacity=0.7,
+            line_opacity=0.3,
+            legend_name=f"{chor_col} (auto)",
+            highlight=True
+        )
+        ch.add_to(m)
+S
+        # Choropleth 위에 툴팁/팝업도 다시 추가(legend만 추가하면 GeoJson 툴팁이 사라질 수 있어서)
+        folium.GeoJson(
+            gj,
+            name=f"Choropleth-boundary ({chor_col})",
+            style_function=lambda x: {"fillOpacity": 0, "color": "#666", "weight": 0.8},
+            tooltip=folium.GeoJsonTooltip(fields=[chor_col]),
+            popup=folium.GeoJsonPopup(fields=[chor_col])
+        ).add_to(m)
+
+# 8) 범례/레이어 컨트롤, 범위 맞춤
+folium.LayerControl(collapsed=False).add_to(m)
+if bounds:
+    minx, miny, maxx, maxy = bounds
+    m.fit_bounds([[miny, minx], [maxy, maxx]])
+
+# 9) 저장 및 표시
+m.save(HTML_OUT)
+m  # 노트북 내 표시 (Colab 미리보기)
+
+print("✅ 지도 생성 완료")
+print("GeoJSON:", GEOJSON_PATH)
+print("HTML 지도 파일:", HTML_OUT)
